@@ -5,6 +5,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
+	//"os/exec"
+	"bufio"
+	"encoding/json"
+	"io/ioutil"
+	"os/user"
 	"runtime"
 	"sync"
 	"time"
@@ -12,12 +19,25 @@ import (
 	"github.com/nilshell/xmlrpc"
 	"github.com/tatsushid/go-fastping"
 	xsclient "github.com/xenserver/go-xenserver-client"
+	"golang.org/x/crypto/ssh/terminal"
 	//"gopkg.in/yaml.v2"
-	//		"gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
+)
+
+var (
+	app = kingpin.New("xensh", "A command-line xen tool")
+
+	findvm = app.Command("findvm", "Find vm - really fast ")
+	vmName = findvm.Arg("vm address", "Address of the VM to find").Required().String()
 )
 
 type XenAPIClient struct {
 	xsclient.XenAPIClient
+}
+
+type Creds struct {
+	Login    string `json:"login"`
+	Password string `json:"password"`
 }
 
 type Config struct {
@@ -70,17 +90,17 @@ func clear_slice(slice []*net.IPAddr) []*net.IPAddr {
 	return r
 }
 
-func scan_ns_hypervisors(domain, dc string, pod, scope int) []*net.IPAddr {
+func scan_ns_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
+	runtime.GOMAXPROCS(4)
 	var wg sync.WaitGroup
 	wg.Add(scope)
 
 	fmt.Println("Resolving hypervisors in parrallel\n")
+	IPs := make([]*net.IPAddr, scope+1)
+	sem := make(chan empty, scope+1)
 
-	IPs := make([]*net.IPAddr, scope)
-	sem := make(chan empty, scope)
-
-	for i := 1; i < scope; i++ {
-		hyp := fmt.Sprintf("hyp%d.pod%d.%s.%s", i, pod, dc, domain)
+	for i := 0; i < scope; i++ {
+		hyp := fmt.Sprintf("hyp%d.%s.%s.%s", i+1, pod, dc, domain)
 		go func(i int) {
 			defer wg.Done()
 
@@ -93,15 +113,14 @@ func scan_ns_hypervisors(domain, dc string, pod, scope int) []*net.IPAddr {
 			sem <- empty{}
 		}(i)
 	}
-	for i := 1; i < scope; i++ {
+	for i := 0; i < scope; i++ {
 		<-sem
 	}
 	IPs = clear_slice(IPs)
 	return IPs
 }
 
-func ping_hypervisors(domain, dc string, pod, scope int) []*net.IPAddr {
-
+func ping_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 	p := fastping.NewPinger()
 	ras := scan_ns_hypervisors(domain, dc, pod, scope)
 
@@ -110,44 +129,134 @@ func ping_hypervisors(domain, dc string, pod, scope int) []*net.IPAddr {
 	}
 
 	PingableIPs := make([]*net.IPAddr, len(ras))
-
 	k := 0
-
 	p.OnRecv = func(addr *net.IPAddr, rtt time.Duration) {
 		PingableIPs[k] = addr
 		k = k + 1
 	}
 
 	p.OnIdle = func() {
-		fmt.Println("finish")
+		fmt.Println(" NS Lookup finished, going to ping")
 	}
 	err := p.Run()
-
 	if err != nil {
 		fmt.Println(err)
 	}
 	return PingableIPs
 }
 
+func read_config() {
+
+}
+
+func XenAuth(hyp string) XenAPIClient {
+	usr, _ := user.Current()
+	config := string(usr.HomeDir) + "/.xensh.json"
+	var login, pass string
+	if _, err := os.Stat(config); os.IsNotExist(err) {
+		if err != nil {
+			login, pass = writeCreds()
+		}
+	} else {
+		lpass := getCreds()
+		login, pass = lpass.Login, lpass.Password
+	}
+
+	x := NewXenAPIClient(hyp, login, pass)
+	x.Login()
+
+	return x
+
+}
+
+func readCreds() (login string, pass string) {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Enter Username: ")
+	username, _ := reader.ReadString('\n')
+
+	fmt.Print("Enter Password: ")
+	bytePassword, err := terminal.ReadPassword(0)
+	if err != nil {
+		panic("Can not read password")
+	}
+
+	login = strings.TrimSpace(username)
+	pass = strings.TrimSpace(string(bytePassword))
+
+	return login, pass
+}
+
+func writeCreds() (login, pass string) {
+	login, pass = readCreds()
+	creds := Creds{login, pass}
+	b, err := json.Marshal(creds)
+
+	usr, err := user.Current()
+	if err != nil {
+		panic("panic")
+	}
+
+	config := string(usr.HomeDir) + "/.xensh.json"
+	err = ioutil.WriteFile(config, b, 0600)
+
+	return login, pass
+}
+
+func getCreds() (c Creds) {
+	usr, err := user.Current()
+	if err != nil {
+		panic("panic")
+	}
+	config := string(usr.HomeDir) + "/.xensh.json"
+	raw, err := ioutil.ReadFile(config)
+	json.Unmarshal(raw, &c)
+	return c
+}
+
+func parseVMName(vmname string) (pod, dc, domain string) {
+	vm := strings.Split(vmname, ".")
+	domain = strings.Join([]string{vm[3], vm[4]}, ".")
+	return vm[1], vm[2], domain
+}
+
 func main() {
 
-	runtime.GOMAXPROCS(4)
+	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
+	case findvm.FullCommand():
+		// SCOPE Should be configurable ?
+		scope := 20
 
-	domain := "zdsys.com"
-	pod := 3
-	dc := "dub1"
-	scope := 20
+		pod, dc, domain := parseVMName(*vmName)
 
-	PingableIPs := ping_hypervisors(domain, dc, pod, scope)
+		PingableIPs := ping_hypervisors(domain, dc, pod, scope)
+		if len(clear_slice(PingableIPs)) == 0 {
+			panic("No pingable IPs found, are on VPN ?")
+		}
 
-	fmt.Println("%+v", PingableIPs)
+		var wg sync.WaitGroup
+		wg.Add(len(PingableIPs) + 1)
+		sem := make(chan empty, len(PingableIPs)+1)
+		var name, hypip string
 
-	c := NewXenAPIClient("hyp1.pod2.sac1.zdsys.com", "root", "989mark3t")
-	c.Login()
-	name_label := "zoo1.pod2.sac1.zdsys.com"
-	vms, _ := c.GetVMByNameLabel(name_label)
-	for _, a := range vms {
-		name, _ := a.GetUuid()
-		fmt.Printf("VM uid = %+v", name)
+		for _, IPAddr := range PingableIPs {
+			go func(IPAddr *net.IPAddr) {
+				defer wg.Done()
+				fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
+				xclient := XenAuth(fmt.Sprintf("%+v", IPAddr))
+				vms, _ := xclient.GetVMByNameLabel(*vmName)
+				for _, a := range vms {
+					name, _ = a.GetUuid()
+					hypip = fmt.Sprintf("%+v", IPAddr)
+					foundhyp, _ := net.LookupAddr(fmt.Sprintf("%v", hypip))
+					fmt.Printf(">>> VM found uid = %+v \n at hyp = %+v \n", name, foundhyp[0])
+					os.Exit(0)
+				}
+				sem <- empty{}
+			}(IPAddr)
+		}
+		for i := 0; i < len(PingableIPs)+1; i++ {
+			<-sem
+		}
 	}
 }
