@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	infoblox "github.com/fanatic/go-infoblox"
 	"github.com/nilshell/xmlrpc"
 	"github.com/tatsushid/go-fastping"
 	xsclient "github.com/xenserver/go-xenserver-client"
@@ -29,6 +30,16 @@ var (
 
 	findvm = app.Command("findvm", "Find vm - really fast ")
 	vmName = findvm.Arg("vm address", "Address of the VM to find").Required().String()
+
+	delvm     = app.Command("delvm", "Destroy vm - really fast ")
+	delvmName = delvm.Arg("vm address", "Address of the VM to find").Required().String()
+	delHyp    = delvm.Arg("hyp address", "Address of hypervisor where delete the machine").Required().String()
+
+	searchdel = app.Command("searchdel", "Search and Destroy vm - really fast ")
+	sdvmName  = searchdel.Arg("vm address", "Address of the VM to find").Required().String()
+
+	delhost  = app.Command("delhost", "Removing all records from Infoblox - not that fast")
+	ibvmName = delhost.Arg("host name", "Name of the host/vm").Required().String()
 )
 
 type XenAPIClient struct {
@@ -95,7 +106,7 @@ func scan_ns_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 	var wg sync.WaitGroup
 	wg.Add(scope)
 
-	fmt.Println("Resolving hypervisors in parrallel\n")
+	fmt.Println("Resolving hypervisors ... \n")
 	IPs := make([]*net.IPAddr, scope+1)
 	sem := make(chan empty, scope+1)
 
@@ -107,9 +118,11 @@ func scan_ns_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 			ip, err := net.ResolveIPAddr("ip4:icmp", hyp)
 			if err == nil {
 				IPs[i+1] = ip
-			} else {
-				fmt.Println(err)
 			}
+			// suppress output
+			//	else {
+			// fmt.Println(err)
+			//	}
 			sem <- empty{}
 		}(i)
 	}
@@ -136,7 +149,7 @@ func ping_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 	}
 
 	p.OnIdle = func() {
-		fmt.Println(" NS Lookup finished, going to ping")
+		fmt.Println("NS Lookup finished, going to ping ... \n")
 	}
 	err := p.Run()
 	if err != nil {
@@ -220,43 +233,158 @@ func parseVMName(vmname string) (pod, dc, domain string) {
 	return vm[1], vm[2], domain
 }
 
+func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
+	var wg sync.WaitGroup
+	wg.Add(len(PingableIPs) + 1)
+	sem := make(chan empty, len(PingableIPs)+1)
+	var name, hypip string
+
+	for _, IPAddr := range PingableIPs {
+		go func(IPAddr *net.IPAddr) {
+			defer wg.Done()
+			fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
+			xclient := XenAuth(fmt.Sprintf("%+v", IPAddr))
+			vms, _ := xclient.GetVMByNameLabel(vmname)
+			for _, a := range vms {
+				name, _ = a.GetUuid()
+				hypip = fmt.Sprintf("%+v", IPAddr)
+				foundhyp, _ := net.LookupAddr(fmt.Sprintf("%v", hypip))
+				fmt.Printf("\n>>> VM found uid = %+v \n>>> at hyp = %+v \n", name, foundhyp[0])
+				hyp = foundhyp[0]
+				close(sem)
+				//os.Exit(0)
+			}
+			//sem <- empty{}
+		}(IPAddr)
+	}
+
+	for i := 0; i < len(PingableIPs)+1; i++ {
+		<-sem
+	}
+	return hyp
+}
+
+func destroyVM(vmname, hyp string) {
+	xclient := XenAuth(hyp)
+	vms, _ := xclient.GetVMByNameLabel(vmname)
+	if len(vms) > 1 {
+		panic("More than one machine with the same label I don't want to delete it")
+	}
+	for _, a := range vms {
+		fmt.Printf("\nDestroy VM = %+v\n", a)
+		if os.Getenv("DRY") == "false" {
+			fmt.Printf("\nWe are destroying VM, like for real %+v\n", a)
+			fmt.Println("Shutting down ..")
+			err := a.HardShutdown()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("Destroying ...")
+			err = a.Destroy()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println("Have a good day, destroyer!")
+		}
+	}
+}
+
+func AuthInfoblox() *infoblox.Client {
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("[INFOBLOX] Enter Username: ")
+	username, _ := reader.ReadString('\n')
+
+	fmt.Print("[INFOBLOX] Enter Password: ")
+	bytePassword, err := terminal.ReadPassword(0)
+	if err != nil {
+		panic("Can not read password")
+	}
+
+	login := strings.TrimSpace(username)
+	pass := strings.TrimSpace(string(bytePassword))
+
+	ib := infoblox.NewClient("https://ddi.zdsys.com", login, pass, false, false)
+
+	return ib
+}
+
+func DelInfobloxRecords(hostname string, ib *infoblox.Client) {
+
+	out, _ := ib.FindRecordHost(hostname)
+	fmt.Printf("out = %+v\n", out)
+	host_object := out[0].Object
+	fmt.Printf("Host object to remove %+v\n", host_object.Ref)
+	ip := fmt.Sprintf("%v", out[0].Ipv4Addrs[0].Ipv4Addr)
+
+	//err := host_object.Delete(nil)
+	err := ib.RecordHostObject(host_object.Ref).Delete(nil)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Printf("Host record to remove %s\n", ip)
+
+	ip_obj, _ := ib.FindIP(ip)
+	fmt.Printf("Fixed IP object to remove %+v\n", ip_obj[0].Object.Ref)
+	err = ib.Ipv4addressObject(ip_obj[0].Object.Ref).Delete(nil)
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+func printList(out []map[string]interface{}, err error) {
+	e(err)
+	for i, v := range out {
+		fmt.Printf("[%d]\n", i)
+		printObject(v, nil)
+	}
+}
+
+func printObject(out map[string]interface{}, err error) {
+	e(err)
+	for k, v := range out {
+		fmt.Printf("  %s: %q\n", k, v)
+	}
+	fmt.Printf("\n")
+}
+
+func e(err error) {
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+}
+
 func main() {
 
 	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
 	case findvm.FullCommand():
 		// SCOPE Should be configurable ?
 		scope := 20
-
 		pod, dc, domain := parseVMName(*vmName)
 
 		PingableIPs := ping_hypervisors(domain, dc, pod, scope)
 		if len(clear_slice(PingableIPs)) == 0 {
 			panic("No pingable IPs found, are on VPN ?")
 		}
+		scanVM(PingableIPs, *vmName)
+	case delvm.FullCommand():
+		destroyVM(*delvmName, *delHyp)
+	case searchdel.FullCommand():
 
-		var wg sync.WaitGroup
-		wg.Add(len(PingableIPs) + 1)
-		sem := make(chan empty, len(PingableIPs)+1)
-		var name, hypip string
+		scope := 20
+		pod, dc, domain := parseVMName(*sdvmName)
 
-		for _, IPAddr := range PingableIPs {
-			go func(IPAddr *net.IPAddr) {
-				defer wg.Done()
-				fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
-				xclient := XenAuth(fmt.Sprintf("%+v", IPAddr))
-				vms, _ := xclient.GetVMByNameLabel(*vmName)
-				for _, a := range vms {
-					name, _ = a.GetUuid()
-					hypip = fmt.Sprintf("%+v", IPAddr)
-					foundhyp, _ := net.LookupAddr(fmt.Sprintf("%v", hypip))
-					fmt.Printf(">>> VM found uid = %+v \n at hyp = %+v \n", name, foundhyp[0])
-					os.Exit(0)
-				}
-				sem <- empty{}
-			}(IPAddr)
+		PingableIPs := ping_hypervisors(domain, dc, pod, scope)
+		if len(clear_slice(PingableIPs)) == 0 {
+			panic("No pingable IPs found, are on VPN ?")
 		}
-		for i := 0; i < len(PingableIPs)+1; i++ {
-			<-sem
-		}
+		hyp := scanVM(PingableIPs, *sdvmName)
+		destroyVM(*sdvmName, hyp)
+	case delhost.FullCommand():
+		ib := AuthInfoblox()
+		DelInfobloxRecords(*ibvmName, ib)
+
 	}
+
 }
