@@ -38,13 +38,16 @@ var (
 	searchdel = app.Command("searchdel", "Search and Destroy vm - really fast ")
 	sdvmName  = searchdel.Arg("vm address", "Address of the VM to find").Required().String()
 
-	delhost  = app.Command("delhost", "Removing all records from Infoblox - not that fast")
-	ibvmName = delhost.Arg("host name", "Name of the host/vm").Required().String()
+	delhost   = app.Command("delhost", "Removing all records from Infoblox - not that fast")
+	ibvmName  = delhost.Arg("host name", "Name of the host/vm").Required().String()
+	ibAddress = delhost.Arg("infoblox grid address", "Address of infoblox API endpoint, e.g. https://grid.infoblox.com").Required().String()
 )
 
 type XenAPIClient struct {
 	xsclient.XenAPIClient
 }
+
+type empty struct{}
 
 type Creds struct {
 	Login    string `json:"login"`
@@ -88,8 +91,6 @@ func (client *XenAPIClient) Login() (err error) {
 	client.Session = result["Value"]
 	return err
 }
-
-type empty struct{}
 
 func clear_slice(slice []*net.IPAddr) []*net.IPAddr {
 	var r []*net.IPAddr
@@ -300,7 +301,7 @@ func destroyVM(vmname, hyp string) {
 	}
 }
 
-func AuthInfoblox() *infoblox.Client {
+func AuthInfoblox(grid string) *infoblox.Client {
 
 	var login, pass string
 
@@ -327,7 +328,7 @@ func AuthInfoblox() *infoblox.Client {
 		login, pass = lpass.Login, lpass.Password
 	}
 
-	ib := infoblox.NewClient("https://ddi.zdsys.com", login, pass, false, false)
+	ib := infoblox.NewClient(grid, login, pass, false, false)
 
 	return ib
 }
@@ -413,7 +414,7 @@ func main() {
 		destroyVM(*sdvmName, hyp)
 
 	case delhost.FullCommand():
-		ib := AuthInfoblox()
+		ib := AuthInfoblox(*ibAddress)
 		DelInfobloxRecords(*ibvmName, ib)
 
 	}
