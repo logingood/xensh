@@ -171,7 +171,7 @@ func XenAuth(hyp string) XenAPIClient {
 			login, pass = writeCreds()
 		}
 	} else {
-		lpass := getCreds()
+		lpass := getCreds(".xensh.json")
 		login, pass = lpass.Login, lpass.Password
 	}
 
@@ -185,10 +185,10 @@ func XenAuth(hyp string) XenAPIClient {
 func readCreds() (login string, pass string) {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Print("Enter Username: ")
+	fmt.Print("[XEN] Enter Username: ")
 	username, _ := reader.ReadString('\n')
 
-	fmt.Print("Enter Password: ")
+	fmt.Print("[XEN] Enter Password: ")
 	bytePassword, err := terminal.ReadPassword(0)
 	if err != nil {
 		panic("Can not read password")
@@ -216,12 +216,12 @@ func writeCreds() (login, pass string) {
 	return login, pass
 }
 
-func getCreds() (c Creds) {
+func getCreds(config_name string) (c Creds) {
 	usr, err := user.Current()
 	if err != nil {
 		panic("panic")
 	}
-	config := string(usr.HomeDir) + "/.xensh.json"
+	config := string(usr.HomeDir) + "/" + config_name
 	raw, err := ioutil.ReadFile(config)
 	json.Unmarshal(raw, &c)
 	return c
@@ -233,34 +233,45 @@ func parseVMName(vmname string) (pod, dc, domain string) {
 	return vm[1], vm[2], domain
 }
 
+func scanSingleVM(IPAddr, vmname string) (hyp, name string, err error) {
+	fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
+	xclient := XenAuth(IPAddr)
+	vms, _ := xclient.GetVMByNameLabel(vmname)
+	if len(vms) > 0 {
+		for _, a := range vms {
+			name, _ = a.GetUuid()
+			foundhyp, _ := net.LookupAddr(IPAddr)
+			fmt.Printf("\n>>> VM found name = %+v, uid = %+v \n>>> at hyp = %+v \n", vmname, name, foundhyp[0])
+			hyp = foundhyp[0]
+		}
+		return hyp, name, nil
+	}
+	return "not found", "not found", fmt.Errorf("didn't find a machine on this hyp")
+}
+
 func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	var wg sync.WaitGroup
-	wg.Add(len(PingableIPs) + 1)
-	sem := make(chan empty, len(PingableIPs)+1)
-	var name, hypip string
+
+	length := len(PingableIPs)
+
+	wg.Add(length)
+	sem := make(chan empty, length)
+
+	var name string
+	var err error
 
 	for _, IPAddr := range PingableIPs {
 		go func(IPAddr *net.IPAddr) {
 			defer wg.Done()
-			fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
-			xclient := XenAuth(fmt.Sprintf("%+v", IPAddr))
-			vms, _ := xclient.GetVMByNameLabel(vmname)
-			for _, a := range vms {
-				name, _ = a.GetUuid()
-				hypip = fmt.Sprintf("%+v", IPAddr)
-				foundhyp, _ := net.LookupAddr(fmt.Sprintf("%v", hypip))
-				fmt.Printf("\n>>> VM found uid = %+v \n>>> at hyp = %+v \n", name, foundhyp[0])
-				hyp = foundhyp[0]
-				close(sem)
-				//os.Exit(0)
-			}
-			//sem <- empty{}
+			hyp, name, err = scanSingleVM(fmt.Sprintf("%v", IPAddr), vmname)
+			sem <- empty{}
 		}(IPAddr)
 	}
 
-	for i := 0; i < len(PingableIPs)+1; i++ {
+	for i := 0; i < length; i++ {
 		<-sem
 	}
+
 	return hyp
 }
 
@@ -291,18 +302,30 @@ func destroyVM(vmname, hyp string) {
 
 func AuthInfoblox() *infoblox.Client {
 
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("[INFOBLOX] Enter Username: ")
-	username, _ := reader.ReadString('\n')
+	var login, pass string
 
-	fmt.Print("[INFOBLOX] Enter Password: ")
-	bytePassword, err := terminal.ReadPassword(0)
-	if err != nil {
-		panic("Can not read password")
+	usr, _ := user.Current()
+	// not recommended to have this file in place for real life
+	config := string(usr.HomeDir) + "/.infoblox.json"
+	if _, err := os.Stat(config); os.IsNotExist(err) {
+		if err != nil {
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Print("[INFOBLOX] Enter Username: ")
+			username, _ := reader.ReadString('\n')
+
+			fmt.Print("[INFOBLOX] Enter Password: ")
+			bytePassword, err := terminal.ReadPassword(0)
+			if err != nil {
+				panic("Can not read password")
+			}
+
+			login = strings.TrimSpace(username)
+			pass = strings.TrimSpace(string(bytePassword))
+		}
+	} else {
+		lpass := getCreds(".infoblox.json")
+		login, pass = lpass.Login, lpass.Password
 	}
-
-	login := strings.TrimSpace(username)
-	pass := strings.TrimSpace(string(bytePassword))
 
 	ib := infoblox.NewClient("https://ddi.zdsys.com", login, pass, false, false)
 
@@ -317,19 +340,26 @@ func DelInfobloxRecords(hostname string, ib *infoblox.Client) {
 	fmt.Printf("Host object to remove %+v\n", host_object.Ref)
 	ip := fmt.Sprintf("%v", out[0].Ipv4Addrs[0].Ipv4Addr)
 
-	//err := host_object.Delete(nil)
-	err := ib.RecordHostObject(host_object.Ref).Delete(nil)
-	if err != nil {
-		fmt.Println(err)
+	var err error
+
+	if os.Getenv("DRY") == "false" {
+		//err := host_object.Delete(nil)
+		err = ib.RecordHostObject(host_object.Ref).Delete(nil)
+		if err != nil {
+			fmt.Println(err)
+		}
 	}
 
 	fmt.Printf("Host record to remove %s\n", ip)
 
 	ip_obj, _ := ib.FindIP(ip)
 	fmt.Printf("Fixed IP object to remove %+v\n", ip_obj[0].Object.Ref)
-	err = ib.Ipv4addressObject(ip_obj[0].Object.Ref).Delete(nil)
-	if err != nil {
-		fmt.Println(err)
+
+	if os.Getenv("DRY") == "false" {
+		err = ib.Ipv4addressObject(ip_obj[0].Object.Ref).Delete(nil)
+		if err != nil {
+			fmt.Println(err)
+		}
 	}
 }
 
@@ -365,7 +395,7 @@ func main() {
 
 		PingableIPs := ping_hypervisors(domain, dc, pod, scope)
 		if len(clear_slice(PingableIPs)) == 0 {
-			panic("No pingable IPs found, are on VPN ?")
+			panic("No pingable IPs found, this app requires SUDO to ping and are you connected to VPN ?")
 		}
 		scanVM(PingableIPs, *vmName)
 	case delvm.FullCommand():
@@ -381,6 +411,7 @@ func main() {
 		}
 		hyp := scanVM(PingableIPs, *sdvmName)
 		destroyVM(*sdvmName, hyp)
+
 	case delhost.FullCommand():
 		ib := AuthInfoblox()
 		DelInfobloxRecords(*ibvmName, ib)
