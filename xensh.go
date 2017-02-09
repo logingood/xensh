@@ -17,9 +17,9 @@ import (
 	"time"
 
 	infoblox "github.com/fanatic/go-infoblox"
+	xsclient "github.com/murat1985/go-xenserver-client"
 	"github.com/nilshell/xmlrpc"
 	"github.com/tatsushid/go-fastping"
-	xsclient "github.com/xenserver/go-xenserver-client"
 	"golang.org/x/crypto/ssh/terminal"
 	//"gopkg.in/yaml.v2"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -31,6 +31,12 @@ var (
 	findvm = app.Command("findvm", "Find vm - really fast ")
 	vmName = findvm.Arg("vm address", "Address of the VM to find").Required().String()
 
+	lsnet    = app.Command("lsnet", "Show network list on a given hyp")
+	lsnetHyp = lsnet.Arg("hyp", "Hyp address").Required().String()
+
+	lsvm    = app.Command("lsvm", "Show vm list on a given hyp")
+	lsvmHyp = lsvm.Arg("hyp", "Hyp address").Required().String()
+
 	delvm     = app.Command("delvm", "Destroy vm - really fast ")
 	delvmName = delvm.Arg("vm address", "Address of the VM to find").Required().String()
 	delHyp    = delvm.Arg("hyp address", "Address of hypervisor where delete the machine").Required().String()
@@ -41,6 +47,15 @@ var (
 	delhost   = app.Command("delhost", "Removing all records from Infoblox - not that fast")
 	ibvmName  = delhost.Arg("host name", "Name of the host/vm").Required().String()
 	ibAddress = delhost.Arg("infoblox grid address", "Address of infoblox API endpoint, e.g. https://grid.infoblox.com").Required().String()
+
+	addvm     = app.Command("addvm", "Add VM - not so fast")
+	addvmName = addvm.Arg("vm name", "Name for the vm, e.g. vm1.podX.DC.domain.com").Required().String()
+	addvmHyp  = addvm.Arg("hypervisor", "Hypervisor where VM should deployed").Required().String()
+	vmMEM     = addvm.Arg("vm ram", "Amount of ram for VM in G").Required().String()
+	vmCPU     = addvm.Arg("cpus", "Amount of CPUs assign to VM").Required().String()
+	vmRoot    = addvm.Arg("root", "Root partition size in G").Required().String()
+	vmData    = addvm.Arg("data size", "Data partition size in G").Required().String()
+	vmMAC     = addvm.Arg("mac addr", "MAC address for the VM to assign").Required().String()
 )
 
 type XenAPIClient struct {
@@ -276,6 +291,36 @@ func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	return hyp
 }
 
+func lsVMs(hyp string) (vms map[string]xmlrpc.Struct) {
+	xclient := XenAuth(hyp)
+	vms, _ = xclient.GetVMRecordsAll()
+	//params = make(map[string]string, 0)
+	for _, v := range vms {
+		if v["is_a_template"] != "true" && v["power_state"] == "Running" {
+			fmt.Println(v["name_label"], "uuid =", v["uuid"], "ram =", v["memory_static_max"], "cpus =", v["VCPUs_max"])
+			//fmt.Println("%+v", v)
+		}
+	}
+	//net_ref := strings.Replace(networks[1].Ref, "OpaqueRef:", "", -1)
+	return vms
+}
+
+func lsNetwork(hyp string) (netrecords map[string]xmlrpc.Struct) {
+	xclient := XenAuth(hyp)
+	netrecords, _ = xclient.GetAllNetRecords()
+	for _, v := range netrecords {
+		fmt.Println("name =", v["name_label"], "uuid =", v["uuid"], "bridge =", v["bridge"])
+	}
+	//fmt.Printf("%+v\n", net["name"])
+	//net_ref := strings.Replace(networks[1].Ref, "OpaqueRef:", "", -1)
+	return netrecords
+}
+
+func addVM(vmname, hyp, mem, cpu, root, data, mac string) {
+	//xclient := XenAuth(hyp)
+
+}
+
 func destroyVM(vmname, hyp string) {
 	xclient := XenAuth(hyp)
 	vms, _ := xclient.GetVMByNameLabel(vmname)
@@ -417,6 +462,14 @@ func main() {
 		ib := AuthInfoblox(*ibAddress)
 		DelInfobloxRecords(*ibvmName, ib)
 
+	case addvm.FullCommand():
+		fmt.Println("stub")
+
+	case lsnet.FullCommand():
+		lsNetwork(*lsnetHyp)
+
+	case lsvm.FullCommand():
+		lsVMs(*lsvmHyp)
 	}
 
 }
