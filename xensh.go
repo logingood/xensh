@@ -37,6 +37,9 @@ var (
 	lsvm    = app.Command("lsvm", "Show vm list on a given hyp")
 	lsvmHyp = lsvm.Arg("hyp", "Hyp address").Required().String()
 
+	lstmp    = app.Command("lstmp", "Show template list on a given hyp")
+	lstmpHyp = lstmp.Arg("hyp", "Hyp address").Required().String()
+
 	delvm     = app.Command("delvm", "Destroy vm - really fast ")
 	delvmName = delvm.Arg("vm address", "Address of the VM to find").Required().String()
 	delHyp    = delvm.Arg("hyp address", "Address of hypervisor where delete the machine").Required().String()
@@ -48,14 +51,15 @@ var (
 	ibvmName  = delhost.Arg("host name", "Name of the host/vm").Required().String()
 	ibAddress = delhost.Arg("infoblox grid address", "Address of infoblox API endpoint, e.g. https://grid.infoblox.com").Required().String()
 
-	addvm     = app.Command("addvm", "Add VM - not so fast")
-	addvmName = addvm.Arg("vm name", "Name for the vm, e.g. vm1.podX.DC.domain.com").Required().String()
-	addvmHyp  = addvm.Arg("hypervisor", "Hypervisor where VM should deployed").Required().String()
-	vmMEM     = addvm.Arg("vm ram", "Amount of ram for VM in G").Required().String()
-	vmCPU     = addvm.Arg("cpus", "Amount of CPUs assign to VM").Required().String()
-	vmRoot    = addvm.Arg("root", "Root partition size in G").Required().String()
-	vmData    = addvm.Arg("data size", "Data partition size in G").Required().String()
-	vmMAC     = addvm.Arg("mac addr", "MAC address for the VM to assign").Required().String()
+	addvm = app.Command("addvm", "Add VM - not so fast")
+	//addvmName = addvm.Arg("vm name", "Name for the vm, e.g. vm1.podX.DC.domain.com").Required().String()
+	addvmHyp = addvm.Arg("hypervisor", "Hypervisor where VM should deployed").Required().String()
+
+	//vmMEM  = addvm.Arg("vm ram", "Amount of ram for VM in G").Required().String()
+	//vmCPU  = addvm.Arg("cpus", "Amount of CPUs assign to VM").Required().String()
+	//vmRoot = addvm.Arg("root", "Root partition size in G").Required().String()
+	//vmData = addvm.Arg("data size", "Data partition size in G").Required().String()
+	//vmMAC  = addvm.Arg("mac addr", "MAC address for the VM to assign").Required().String()
 )
 
 type XenAPIClient struct {
@@ -291,12 +295,12 @@ func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	return hyp
 }
 
-func lsVMs(hyp string) (vms map[string]xmlrpc.Struct) {
+func lsVMs(hyp, powerstate, template string) (vms map[string]xmlrpc.Struct) {
 	xclient := XenAuth(hyp)
 	vms, _ = xclient.GetVMRecordsAll()
 	//params = make(map[string]string, 0)
 	for _, v := range vms {
-		if v["is_a_template"] != "true" && v["power_state"] == "Running" {
+		if fmt.Sprintf("%v", v["is_a_template"]) == template && fmt.Sprintf("%v", v["power_state"]) == powerstate {
 			fmt.Println(v["name_label"], "uuid =", v["uuid"], "ram =", v["memory_static_max"], "cpus =", v["VCPUs_max"])
 			//fmt.Println("%+v", v)
 		}
@@ -316,9 +320,19 @@ func lsNetwork(hyp string) (netrecords map[string]xmlrpc.Struct) {
 	return netrecords
 }
 
-func addVM(vmname, hyp, mem, cpu, root, data, mac string) {
-	//xclient := XenAuth(hyp)
+func ip2mac(ip_str string) (net.HardwareAddr, error) {
+	ip := net.ParseIP(ip_str).To4()
+	str_mac := fmt.Sprintf("00:16:3e:%x:%x:%x", ip[1], ip[2], ip[3])
+	mac, err := net.ParseMAC(str_mac)
+	return mac, err
+}
 
+//func addVM(vmname, hyp, mem, cpu, root, data) {
+func addVM(hyp string) {
+	xclient := XenAuth(hyp)
+	// get srs
+	srs, _ := xclient.GetSRByNameLabel("Local storage")
+	fmt.Printf("%+v\n", srs[0])
 }
 
 func destroyVM(vmname, hyp string) {
@@ -463,13 +477,15 @@ func main() {
 		DelInfobloxRecords(*ibvmName, ib)
 
 	case addvm.FullCommand():
-		fmt.Println("stub")
+		addVM(*addvmHyp)
 
 	case lsnet.FullCommand():
 		lsNetwork(*lsnetHyp)
 
 	case lsvm.FullCommand():
-		lsVMs(*lsvmHyp)
+		lsVMs(*lsvmHyp, "Running", "false")
+	case lstmp.FullCommand():
+		lsVMs(*lstmpHyp, "Halted", "true")
 	}
 
 }
