@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	//"os/exec"
 	"bufio"
@@ -182,6 +183,17 @@ func read_config() {
 
 }
 
+func XenBasicAuth(hyp string) XenAPIClient {
+	var login, pass string
+
+	lpass := getCreds(".xensh.json")
+	login, pass = lpass.Login, lpass.Password
+
+	x := NewXenAPIClient(hyp, login, pass)
+	x.Login()
+	return x
+}
+
 func XenAuth(hyp string) XenAPIClient {
 	usr, _ := user.Current()
 	config := string(usr.HomeDir) + "/.xensh.json"
@@ -255,7 +267,7 @@ func parseVMName(vmname string) (pod, dc, domain string) {
 
 func scanSingleVM(IPAddr, vmname string) (hyp, name string, err error) {
 	fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
-	xclient := XenAuth(IPAddr)
+	xclient := XenBasicAuth(IPAddr)
 	vms, _ := xclient.GetVMByNameLabel(vmname)
 	if len(vms) > 0 {
 		for _, a := range vms {
@@ -280,6 +292,14 @@ func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	var name string
 	var err error
 
+	usr, _ := user.Current()
+	config := string(usr.HomeDir) + "/.xensh.json"
+	if _, err := os.Stat(config); os.IsNotExist(err) {
+		if err != nil {
+			writeCreds()
+		}
+	}
+
 	for _, IPAddr := range PingableIPs {
 		go func(IPAddr *net.IPAddr) {
 			defer wg.Done()
@@ -293,6 +313,16 @@ func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	}
 
 	return hyp
+}
+
+func getVMState(vmname string, xclient XenAPIClient) xmlrpc.Struct {
+	vms, _ := xclient.GetVMRecordsAll()
+	for _, v := range vms {
+		if v["uuid"] == vmname || v["name_label"] == vmname {
+			return v
+		}
+	}
+	return nil
 }
 
 func lsVMs(hyp, powerstate, template string) (vms map[string]xmlrpc.Struct) {
@@ -335,28 +365,43 @@ func addVM(hyp string) {
 	fmt.Printf("%+v\n", srs[0])
 }
 
+func deleteVMS(vms *xsclient.VM, vmname string, xclient XenAPIClient) {
+	fmt.Printf("\nDestroy VM = %+v\n", vms)
+	if os.Getenv("DRY") == "false" {
+		fmt.Printf("\nWe are destroying VM, like for real %+v\n", vms)
+		v := getVMState(vmname, xclient)
+		if v["power_state"] == "Running" {
+			fmt.Println("Shutting down ..")
+			err := vms.HardShutdown()
+			if err != nil {
+				panic(err)
+			}
+		} else {
+			fmt.Println("Shut down is not require powerstate =", v["power_state"])
+		}
+		fmt.Println("Destroying ...")
+		err := vms.Destroy()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("Have a good day, destroyer!")
+	}
+}
+
 func destroyVM(vmname, hyp string) {
 	xclient := XenAuth(hyp)
-	vms, _ := xclient.GetVMByNameLabel(vmname)
-	if len(vms) > 1 {
-		panic("More than one machine with the same label I don't want to delete it")
-	}
-	for _, a := range vms {
-		fmt.Printf("\nDestroy VM = %+v\n", a)
-		if os.Getenv("DRY") == "false" {
-			fmt.Printf("\nWe are destroying VM, like for real %+v\n", a)
-			fmt.Println("Shutting down ..")
-			err := a.HardShutdown()
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("Destroying ...")
-			err = a.Destroy()
-			if err != nil {
-				panic(err)
-			}
-			fmt.Println("Have a good day, destroyer!")
+	var vms []*xsclient.VM
+	vmname_regexp := regexp.MustCompile("^[^-]{8}-[^-]{4}-[^-]{4}-[^-]{4}-[^-]{12}$")
+
+	if vmname_regexp.MatchString(vmname) == false {
+		vms, _ = xclient.GetVMByNameLabel(vmname)
+		if len(vms) > 1 {
+			panic("More than one machine with the same label I don't want to delete it")
 		}
+		deleteVMS(vms[0], vmname, xclient)
+	} else {
+		vms_by_uuid, _ := xclient.GetVMByUuid(vmname)
+		deleteVMS(vms_by_uuid, vmname, xclient)
 	}
 }
 
