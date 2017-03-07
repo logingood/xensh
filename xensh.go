@@ -18,8 +18,10 @@ import (
 	"time"
 
 	infoblox "github.com/fanatic/go-infoblox"
+	"github.com/fatih/color"
 	xsclient "github.com/murat1985/go-xenserver-client"
 	"github.com/nilshell/xmlrpc"
+	"github.com/olekukonko/tablewriter"
 	"github.com/tatsushid/go-fastping"
 	"golang.org/x/crypto/ssh/terminal"
 	//"gopkg.in/yaml.v2"
@@ -27,7 +29,8 @@ import (
 )
 
 var (
-	app = kingpin.New("xensh", "A command-line xen tool")
+	app         = kingpin.New("xensh", "A command-line xen tool")
+	shortOutput = app.Flag("short", "We try to be quiet and short as we can").Short('s').Bool()
 
 	findvm = app.Command("findvm", "Find vm - really fast ")
 	vmName = findvm.Arg("vm address", "Address of the VM to find").Required().String()
@@ -127,7 +130,9 @@ func scan_ns_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 	var wg sync.WaitGroup
 	wg.Add(scope)
 
-	fmt.Println("Resolving hypervisors ... \n")
+	if !*shortOutput {
+		fmt.Println("Resolving hypervisors ... \n")
+	}
 	IPs := make([]*net.IPAddr, scope+1)
 	sem := make(chan empty, scope+1)
 
@@ -170,7 +175,9 @@ func ping_hypervisors(domain, dc, pod string, scope int) []*net.IPAddr {
 	}
 
 	p.OnIdle = func() {
-		fmt.Println("NS Lookup finished, going to ping ... \n")
+		if !*shortOutput {
+			fmt.Println("NS Lookup finished, going to ping ... \n")
+		}
 	}
 	err := p.Run()
 	if err != nil {
@@ -265,15 +272,22 @@ func parseVMName(vmname string) (pod, dc, domain string) {
 	return vm[1], vm[2], domain
 }
 
-func scanSingleVM(IPAddr, vmname string) (hyp, name string, err error) {
-	fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
+func scanSingleVM(IPAddr, vmname string, short bool) (hyp, name string, err error) {
+	if !short {
+		fmt.Printf("Scanning VM in HYP %+v\n", IPAddr)
+	}
 	xclient := XenBasicAuth(IPAddr)
 	vms, _ := xclient.GetVMByNameLabel(vmname)
 	if len(vms) > 0 {
 		for _, a := range vms {
 			name, _ = a.GetUuid()
 			foundhyp, _ := net.LookupAddr(IPAddr)
-			fmt.Printf("\n>>> VM found name = %+v, uid = %+v \n>>> at hyp = %+v \n", vmname, name, foundhyp[0])
+			green := color.New(color.Bold, color.FgGreen).SprintFunc()
+			if !short {
+				fmt.Printf("\n>>> VM found name = %+v, uid = %+v \n>>> at hyp = %+v \n", vmname, green(name), foundhyp[0])
+			} else {
+				fmt.Printf("%v\n", green(name))
+			}
 			hyp = foundhyp[0]
 		}
 		return hyp, name, nil
@@ -281,7 +295,7 @@ func scanSingleVM(IPAddr, vmname string) (hyp, name string, err error) {
 	return "not found", "not found", fmt.Errorf("didn't find a machine on this hyp")
 }
 
-func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
+func scanVM(PingableIPs []*net.IPAddr, vmname string, short bool) (hyp string) {
 	var wg sync.WaitGroup
 
 	length := len(PingableIPs)
@@ -303,7 +317,7 @@ func scanVM(PingableIPs []*net.IPAddr, vmname string) (hyp string) {
 	for _, IPAddr := range PingableIPs {
 		go func(IPAddr *net.IPAddr) {
 			defer wg.Done()
-			hyp, name, err = scanSingleVM(fmt.Sprintf("%v", IPAddr), vmname)
+			hyp, name, err = scanSingleVM(fmt.Sprintf("%v", IPAddr), vmname, short)
 			sem <- empty{}
 		}(IPAddr)
 	}
@@ -329,12 +343,20 @@ func lsVMs(hyp, powerstate, template string) (vms map[string]xmlrpc.Struct) {
 	xclient := XenAuth(hyp)
 	vms, _ = xclient.GetVMRecordsAll()
 	//params = make(map[string]string, 0)
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Hostname", "UUID", "RAM", "CPUS"})
 	for _, v := range vms {
 		if fmt.Sprintf("%v", v["is_a_template"]) == template && fmt.Sprintf("%v", v["power_state"]) == powerstate {
-			fmt.Println(v["name_label"], "uuid =", v["uuid"], "ram =", v["memory_static_max"], "cpus =", v["VCPUs_max"])
+			table.Append([]string{
+				fmt.Sprintf("%v", v["name_label"]),
+				fmt.Sprintf("%v", v["uuid"]),
+				fmt.Sprintf("%v", v["memory_static_max"]),
+				fmt.Sprintf("%v", v["VCPUs_max"])})
 			//fmt.Println("%+v", v)
 		}
 	}
+	table.Render()
+
 	//net_ref := strings.Replace(networks[1].Ref, "OpaqueRef:", "", -1)
 	return vms
 }
@@ -502,7 +524,7 @@ func main() {
 		if len(clear_slice(PingableIPs)) == 0 {
 			panic("No pingable IPs found, this app requires SUDO to ping and are you connected to VPN ?")
 		}
-		scanVM(PingableIPs, *vmName)
+		scanVM(PingableIPs, *vmName, *shortOutput)
 	case delvm.FullCommand():
 		destroyVM(*delvmName, *delHyp)
 	case searchdel.FullCommand():
@@ -514,7 +536,7 @@ func main() {
 		if len(clear_slice(PingableIPs)) == 0 {
 			panic("No pingable IPs found, are on VPN ?")
 		}
-		hyp := scanVM(PingableIPs, *sdvmName)
+		hyp := scanVM(PingableIPs, *sdvmName, *shortOutput)
 		destroyVM(*sdvmName, hyp)
 
 	case delhost.FullCommand():
